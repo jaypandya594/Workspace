@@ -1,0 +1,611 @@
+     1→# iSecurify GRC Platform — Coolify Deployment Guide
+     2→
+     3→A full-featured Governance, Risk, and Compliance (GRC) platform for managing policies, frameworks, controls, audits, risks, vulnerabilities, evidence, and multi-tenant operations. This guide walks you through deploying the entire stack on **Coolify** — a self-hosting PaaS that runs on your own VPS.
+     4→
+     5→---
+     6→
+     7→## Architecture Overview
+     8→
+     9→| Layer | Technology | Details |
+    10→|-------|-----------|---------|
+    11→| **Frontend** | Next.js 16 (App Router) | React 19, TypeScript, Tailwind CSS 4, shadcn/ui components |
+    12→| **Runtime** | Bun | Used as the Node runtime (`bun .next/standalone/server.js`) |
+    13→| **Output Mode** | Next.js Standalone | `output: "standalone"` in `next.config.ts` — single deployable artifact |
+    14→| **Database** | MySQL 8.0 | Coolify-managed resource with persistent Docker volume |
+    15→| **ORM** | Prisma 6.x | Schema sync via `prisma db push` (no migration files) |
+    16→| **Authentication** | Custom scrypt session auth | `scryptSync` password hashing, session tokens stored in DB, HttpOnly cookies |
+    17→| **File Uploads** | Docker volume | Uploaded evidence files persisted at `/app/uploads` inside the container |
+    18→| **API** | Next.js Route Handlers | RESTful JSON API under `/api/*` with RBAC per tenant |
+    19→| **UI State** | Zustand + TanStack Query | Client-side state management and server-state caching |
+    20→| **Charts** | Recharts | Dashboard analytics, risk heatmaps, audit progress |
+    21→
+    22→### Key Design Decisions
+    23→
+    24→- **Prisma `db push` instead of migrations** — the schema is the source of truth; `prisma db push` synchronizes it directly to the database without generating migration files. This is ideal for early-stage SaaS where the schema evolves rapidly.
+    25→- **Custom auth instead of NextAuth** — although `next-auth` is listed as a dependency, the actual authentication system is fully custom: password hashing uses Node.js `crypto.scryptSync`, session tokens are generated with `crypto.randomBytes(32)` and stored in the `Session` table, and session cookies are set as `HttpOnly` / `Secure` / `SameSite=Lax`.
+    26→- **Multi-tenant RBAC** — three user roles: `super_admin` (platform-wide), `tenant_admin` (tenant-wide), and `member` (tenant-scoped). All API routes enforce tenant isolation.
+    27→
+    28→---
+    29→
+    30→## Prerequisites
+    31→
+    32→| Requirement | Details |
+    33→|-----------|---------|
+    34→| **Server** | Ubuntu 22.04 VPS with **4 GB+ RAM** recommended (Bun + Next.js standalone + MySQL) |
+    35→| **Coolify** | Installed and running on the VPS — see [https://coolify.io/docs/installation](https://coolify.io/docs/installation) |
+    36→| **Domain** | A registered domain with a **DNS A record** pointing to your VPS IP address |
+    37→| **GitHub Repository** | This code pushed to a GitHub/GitLab repo that Coolify can access |
+    38→| **MySQL Resource** | A MySQL 8.0 resource provisioned inside Coolify (or via docker-compose) |
+    39→| **Schema Adjustment** | The Prisma schema `provider` must be changed from `"sqlite"` to `"mysql"` for Coolify deployment (see Step 2 notes below) |
+    40→
+    41→> **Important — Schema Provider:** The default `prisma/schema.prisma` uses `provider = "sqlite"` for local development. Before deploying to Coolify with MySQL, change the datasource provider to `"mysql"`:
+    42→> ```prisma
+    43→> datasource db {
+    44→>   provider = "mysql"
+    45→>   url      = env("DATABASE_URL")
+    46→> }
+    47→> ```
+    48→
+    49→---
+    50→
+    51→## Step 1 — Push Code to GitHub
+    52→
+    53→If you haven't already, initialize a Git repository and push your code to GitHub so Coolify can pull it:
+    54→
+    55→```bash
+    56→# Navigate to your project directory
+    57→cd /home/z/my-project
+    58→
+    59→# Initialize Git (if not already done)
+    60→git init
+    61→
+    62→# Stage all files
+    63→git add .
+    64→
+    65→# First commit
+    66→git commit -m "Initial commit: iSecurify GRC Platform"
+    67→
+    68→# Add your GitHub remote (replace with your actual repo URL)
+    69→git remote add origin https://github.com/YOUR_USERNAME/isecurify-grc.git
+    70→
+    71→# Push to main branch
+    72→git branch -M main
+    73→git push -u origin main
+    74→```
+    75→
+    76→> **Note:** Make sure `bun.lock` is committed to the repository — it is required for reproducible builds in the Docker container. Verify it exists:
+    77→> ```bash
+    78→> git status bun.lock   # should show as tracked
+    79→> ```
+    80→
+    81→---
+    82→
+    83→## Step 2 — MySQL in Coolify
+    84→
+    85→### Create the MySQL Resource
+    86→
+    87→1. Log into your Coolify dashboard at `https://your-coolify-domain.com`
+    88→2. Navigate to **Resources** → **New Resource** → **Database**
+    89→3. Select **MySQL 8.0** as the database type
+    90→4. Configure the following settings:
+    91→
+    92→| Setting | Value |
+    93→|---------|-------|
+    94→| **Service Name** | `mysql` (or any name you prefer — this becomes the hostname in DATABASE_URL) |
+    95→| **Database Name** | `isecurify` |
+    96→| **Username** | `isecurify_user` |
+    97→| **Password** | Generate a strong password (e.g., `openssl rand -base64 24`) |
+    98→| **Image** | `mysql:8.0` |
+    99→
+   100→5. Under **Storage**, enable **persistent storage** — Coolify will create a Docker volume so your database survives container restarts
+   101→6. Click **Create**
+   102→
+   103→### Get the Connection String
+   104→
+   105→After MySQL is provisioned, Coolify will display the internal connection string. It will look like:
+   106→
+   107→```
+   108→mysql://isecurify_user:YOUR_PASSWORD@mysql:3306/isecurify
+   109→```
+   110→
+   111→> **Hostname note:** Coolify uses the service name as the hostname. If you named your MySQL service `mysql`, the host is simply `mysql`. If you named it `mysql-isecurify`, use that instead. Copy this connection string — you'll need it for the `DATABASE_URL` environment variable in Step 4.
+   112→
+   113→---
+   114→
+   115→## Step 3 — Create Application in Coolify
+   116→
+   117→1. In Coolify, navigate to **Resources** → **New Resource** → **Application**
+   118→2. Select **GitHub** (or GitLab) as the source
+   119→3. Authenticate with your GitHub account and select the repository containing this code
+   120→4. Configure the build settings:
+   121→
+   122→| Setting | Value |
+   123→|---------|-------|
+   124→| **Build Pack** | `Dockerfile` |
+   125→| **Dockerfile Location** | `Dockerfile` (root of the repo) |
+   126→| **Port** | `3000` |
+   127→| **Branch** | `main` |
+   128→
+   129→> **Important — Dockerfile Required:** The project uses a multi-stage Docker build. If a `Dockerfile` does not yet exist in the repo root, create one (see the Dockerfile section below). Coolify will use it to build the container image.
+   130→
+   131→### Dockerfile (create if not present)
+   132→
+   133→```dockerfile
+   134→# ---- Stage 1: Dependencies ----
+   135→FROM oven/bun:1 AS deps
+   136→WORKDIR /app
+   137→COPY package.json bun.lock ./
+   138→RUN bun install --frozen-lockfile
+   139→
+   140→# ---- Stage 2: Build ----
+   141→FROM oven/bun:1 AS builder
+   142→WORKDIR /app
+   143→COPY --from=deps /app/node_modules ./node_modules
+   144→COPY . .
+   145→RUN bunx prisma generate
+   146→RUN bun run build
+   147→
+   148→# ---- Stage 3: Production ----
+   149→FROM oven/bun:1 AS runner
+   150→WORKDIR /app
+   151→
+   152→ENV NODE_ENV=production
+   153→ENV PORT=3000
+   154→
+   155→# Create uploads directory
+   156→RUN mkdir -p /app/uploads
+   157→
+   158→# Copy standalone output and public assets
+   159→COPY --from=builder /app/.next/standalone ./
+   160→COPY --from=builder /app/.next/static ./.next/static
+   161→COPY --from=builder /app/public ./public
+   162→COPY --from=builder /app/prisma ./prisma
+   163→
+   164→# Copy node_modules for Prisma CLI at runtime
+   165→COPY --from=deps /app/node_modules/.prisma ./node_modules/.prisma
+   166→COPY --from=deps /app/node_modules/@prisma ./node_modules/@prisma
+   167→COPY --from=deps /app/node_modules/prisma ./node_modules/prisma
+   168→
+   169→# Copy seed script
+   170→COPY --from=builder /app/prisma/seed.ts ./prisma/seed.ts
+   171→COPY --from=builder /app/src ./src
+   172→
+   173→EXPOSE 3000
+   174→
+   175→# Entrypoint runs Prisma db push on every startup, then seeds if SEED_DB=true
+   176→COPY <<'ENTRYPOINT' /app/entrypoint.sh
+   177→#!/bin/sh
+   178→set -e
+   179→echo ">>> Running Prisma db push..."
+   180→bunx prisma db push --accept-data-loss 2>/dev/null || bunx prisma db push
+   181→echo ">>> Prisma schema synced."
+   182→if [ "$SEED_DB" = "true" ]; then
+   183→  echo ">>> Seeding database..."
+   184→  bun run prisma/seed.ts
+   185→  echo ">>> Seed complete."
+   186→fi
+   187→echo ">>> Starting iSecurify GRC Platform on port ${PORT:-3000}..."
+   188→exec bun .next/standalone/server.js
+   189→ENTRYPOINT
+   190→
+   191→RUN chmod +x /app/entrypoint.sh
+   192→
+   193→CMD ["/app/entrypoint.sh"]
+   194→```
+   195→
+   196→> **What the entrypoint does:**
+   197→> 1. Runs `prisma db push` to sync the schema to MySQL on every container startup
+   198→> 2. If `SEED_DB=true`, runs the seed script to create demo data
+   199→> 3. Starts the Next.js standalone server
+   200→
+   201→---
+   202→
+   203→## Step 4 — Environment Variables in Coolify
+   204→
+   205→In Coolify, navigate to your **Application** → **Environment Variables** panel and add each of the following:
+   206→
+   207→| Variable | Example Value | Description |
+   208→|----------|--------------|-------------|
+   209→| `DATABASE_URL` | `mysql://isecurify_user:YOUR_PASSWORD@mysql:3306/isecurify` | Prisma connection string. **Host** must match your Coolify MySQL service name. |
+   210→| `NEXTAUTH_SECRET` | _(generate below)_ | Required by the `next-auth` package even though custom auth is used. Generate with: `openssl rand -base64 32` |
+   211→| `NEXTAUTH_URL` | `https://your-domain.com` | Public URL of your app (used by next-auth internally). Must include the protocol. |
+   212→| `NEXT_PUBLIC_APP_URL` | `https://your-domain.com` | Exposed to the browser; used for API calls and links from the client side. |
+   213→| `NODE_ENV` | `production` | Disables development-only features and enables Next.js production optimizations. |
+   214→| `PORT` | `3000` | The port the standalone server listens on. Must match the Coolify port config. |
+   215→| `UPLOAD_PATH` | `/app/uploads` | Filesystem path where evidence uploads are stored inside the container. |
+   216→| `SEED_DB` | `true` | **First deploy only.** Set to `true` to seed the database with demo users, tenants, frameworks, and controls. Remove or set to `false` after first successful deploy. |
+   217→
+   218→### Generating a Secure NEXTAUTH_SECRET
+   219→
+   220→```bash
+   221→openssl rand -base64 32
+   222→```
+   223→
+   224→Copy the output and paste it as the value for `NEXTAUTH_SECRET`. Example output:
+   225→```
+   226→aB3dE7fG9hJ2kL5mN8pQ1rS4tU6vW0xY3zA6cD9eF2gH5iK8jL1mN4pQ7r==
+   227→```
+   228→
+   229→### Environment Variable Notes
+   230→
+   231→- **DATABASE_URL host**: The hostname in DATABASE_URL must match the Coolify service name of your MySQL resource. If your MySQL service is named `mysql` in Coolify, use `mysql` as the host. If named `mysql-isecurify-db`, use that. Coolify's internal DNS resolves service names to container IPs.
+   232→- **NEXTAUTH_SECRET**: Although the platform uses a custom session-based auth system (not NextAuth handlers), the `next-auth` package is imported as a dependency and may throw errors if `NEXTAUTH_SECRET` is not set. Always include it.
+   233→- **SEED_DB**: This env var is checked by the Docker entrypoint script. When `true`, the seed script (`prisma/seed.ts`) runs after `prisma db push`. The seed creates a Super Admin user, a demo tenant (Acme Corporation), sample frameworks (SOC 2, ISO 27001), controls, and audit data.
+   234→
+   235→---
+   236→
+   237→## Step 5 — Persistent Storage (Uploads)
+   238→
+   239→Evidence files uploaded through the platform (screenshots, documents, compliance artifacts) are stored on the container filesystem. Without persistent storage, these files are lost on every redeploy.
+   240→
+   241→### Mount a Volume in Coolify
+   242→
+   243→1. Navigate to your **Application** in Coolify
+   244→2. Go to the **Storages** (or **Volumes**) tab
+   245→3. Click **Add Storage**
+   246→4. Set the following:
+   247→
+   248→| Setting | Value |
+   249→|---------|-------|
+   250→| **Container Path** | `/app/uploads` |
+   251→| **Volume Name** | Coolify will auto-generate a name (e.g., `isecurify-uploads`) |
+   252→| **Type** | Volume (not bind mount) |
+   253→
+   254→5. Click **Save**
+   255→
+   256→The Dockerfile already creates `/app/uploads` during the build, and the Coolify volume mount ensures this directory persists across container restarts, rebuilds, and redeployments.
+   257→
+   258→> **How uploads work:** When a user uploads evidence via the API (`POST /api/evidence`), the server saves the file to `/app/uploads/{controlId}/{filename}` and stores a relative `filePath` (e.g., `uploads/ctrl-abc123/evidence.pdf`) in the database. The volume mount ensures these files survive container lifecycle events.
+   259→
+   260→---
+   261→
+   262→## Step 6 — Domain & SSL
+   263→
+   264→### Configure Your Domain
+   265→
+   266→1. In Coolify, navigate to your **Application** → **Domains** tab
+   267→2. Click **Add Domain**
+   268→3. Enter your domain (e.g., `grc.yourdomain.com`)
+   269→4. Ensure the domain's DNS A record points to your VPS IP:
+   270→
+   271→```
+   272→grc.yourdomain.com.  IN  A  203.0.113.50
+   273→```
+   274→
+   275→5. After adding the domain, Coolify will provision a reverse proxy (Traefik/Caddy) to route traffic
+   276→
+   277→### Enable SSL (Let's Encrypt)
+   278→
+   279→1. In the **Domains** section, toggle on **"Generate SSL Certificate"**
+   280→2. Coolify will automatically request a Let's Encrypt certificate
+   281→3. Within a few minutes, your site will be accessible at `https://grc.yourdomain.com`
+   282→
+   283→> **SSL is mandatory** for the authentication system to work correctly. The custom session cookies are set with the `Secure` flag, which means browsers will not send them over HTTP.
+   284→
+   285→---
+   286→
+   287→## Step 7 — First Deployment
+   288→
+   289→### Deploy with Seed Data
+   290→
+   291→1. Ensure all environment variables from **Step 4** are configured
+   292→2. Ensure `SEED_DB=true` is set in the environment variables
+   293→3. Ensure the MySQL service is running in Coolify (check its status in Resources)
+   294→4. In Coolify, navigate to your **Application** → **Deployments** tab
+   295→5. Click **Deploy Now**
+   296→
+   297→### What Happens During First Deploy
+   298→
+   299→1. Coolify pulls your code from GitHub
+   300→2. Docker builds the image using the Dockerfile
+   301→3. The container starts and runs the entrypoint script:
+   302→   - `prisma db push` syncs the schema to MySQL (creates all tables)
+   303→   - `bun run prisma/seed.ts` creates demo data (since `SEED_DB=true`)
+   304→   - Next.js standalone server starts on port 3000
+   305→4. Coolify's reverse proxy routes traffic to the container
+   306→
+   307→### After First Deploy
+   308→
+   309→1. Verify the app loads at your domain
+   310→2. Log in with the default credentials (see below)
+   311→3. **Immediately change the default passwords**
+   312→4. Go back to **Environment Variables** in Coolify
+   313→5. Remove `SEED_DB=true` or set it to `false`
+   314→6. **Redeploy** to ensure the seed doesn't run again on future startups
+   315→
+   316→> **Why remove SEED_DB?** The seed script uses `upsert` operations, so it won't duplicate data. However, it will reset passwords back to defaults if left enabled. Always remove it after the first successful deploy.
+   317→
+   318→---
+   319→
+   320→## Default Login Credentials
+   321→
+   322→The seed script creates the following users:
+   323→
+   324→### Super Admin (Platform-wide access)
+   325→
+   326→| Field | Value |
+   327→|-------|-------|
+   328→| **Email** | `superadmin@isecurify.com` |
+   329→| **Password** | `Admin@123` |
+   330→| **Role** | `super_admin` |
+   331→| **Scope** | Full platform — all tenants, all data |
+   332→
+   333→### Tenant Admin (Acme Corporation demo tenant)
+   334→
+   335→| Field | Value |
+   336→|-------|-------|
+   337→| **Email** | `sarah.mitchell@acme.com` |
+   338→| **Password** | `Tenant@123` |
+   339→| **Role** | `tenant_admin` |
+   340→| **Scope** | Acme Corporation tenant only |
+   341→
+   342→### Additional Seed Users
+   343→
+   344→The seed script also creates these demo users within the Acme Corporation tenant:
+   345→
+   346→| Email | Name | Role | Password |
+   347→|-------|------|------|----------|
+   348→| `sarah.mitchell@acme.com` | Sarah Mitchell | `tenant_admin` | `Tenant@123` |
+   349→| `james.wilson@acme.com` | James Wilson | `member` | `Tenant@123` |
+   350→| `maria.garcia@acme.com` | Maria Garcia | `member` | `Tenant@123` |
+   351→
+   352→> **SECURITY WARNING:** Change ALL default passwords immediately after first login. Navigate to **Settings** → **Users** (for Super Admin) or **Settings** → **Profile** → **Change Password** (for tenant users).
+   353→
+   354→---
+   355→
+   356→## Prisma Commands (Run in Coolify Terminal)
+   357→
+   358→You can access a shell inside the running container via Coolify's **Terminal** feature (Application → Terminal).
+   359→
+   360→```bash
+   361→# Schema sync (runs automatically on startup via entrypoint)
+   362→# This synchronizes your prisma/schema.prisma with the MySQL database
+   363→bunx prisma db push
+   364→
+   365→# Generate Prisma client (runs during Docker build, but can be re-run manually)
+   366→bunx prisma generate
+   367→
+   368→# Manual seed — re-runs the seed script to create/refresh demo data
+   369→bun run prisma/seed.ts
+   370→
+   371→# Inspect database visually — opens Prisma Studio (if port is exposed)
+   372→bunx prisma studio
+   373→
+   374→# Check schema for errors without connecting to DB
+   375→bunx prisma validate
+   376→```
+   377→
+   378→> **Note on `prisma db push` vs migrations:** This project uses `db push` which applies schema changes directly. It does not create migration history files. If you need migration history for compliance, consider switching to `prisma migrate dev` and `prisma migrate deploy`.
+   379→
+   380→---
+   381→
+   382→## Redeploy / Updates
+   383→
+   384→### Automatic Deploy (Recommended)
+   385→
+   386→1. Configure a **GitHub webhook** in Coolify: Application → Settings → Webhook URL
+   387→2. Add the webhook URL to your GitHub repo: Settings → Webhooks → Add webhook
+   388→3. Every push to the `main` branch triggers an automatic Coolify deploy
+   389→
+   390→### Manual Deploy
+   391→
+   392→1. Push code changes to GitHub
+   393→2. In Coolify, navigate to your Application → Deployments
+   394→3. Click **Deploy Now**
+   395→
+   396→### Schema Changes
+   397→
+   398→When you update `prisma/schema.prisma`:
+   399→
+   400→1. Commit and push the schema change to GitHub
+   401→2. The Docker build runs `prisma generate` during the build stage
+   402→3. On container startup, the entrypoint runs `prisma db push` — this automatically applies schema changes to MySQL
+   403→4. No manual migration commands needed
+   404→
+   405→> **If you need to accept data loss** (e.g., dropping a column), the entrypoint uses `--accept-data-loss` flag by default. Review schema changes carefully before deploying.
+   406→
+   407→---
+   408→
+   409→## File Uploads
+   410→
+   411→### How Uploads Work
+   412→
+   413→1. **Client** sends a `POST` request to `/api/evidence` with a file
+   414→2. **Server** saves the file to `/app/uploads/{controlId}/{uuid}-{filename}`
+   415→3. **Database** stores the relative file path (e.g., `uploads/ctrl-soc2-01/a1b2c3-report.pdf`)
+   416→4. **Volume** at `/app/uploads` persists the files across container lifecycle events
+   417→
+   418→### Upload Storage Details
+   419→
+   420→| Aspect | Detail |
+   421→|--------|--------|
+   422→| **Container Path** | `/app/uploads` |
+   423→| **Volume Type** | Docker named volume (managed by Coolify) |
+   424→| **Persistence** | Survives container restarts, rebuilds, and redeployments |
+   425→| **Access** | Files are served through the API (`GET /api/evidence`) or directly if public assets are configured |
+   426→| **Cleanup** | No automatic cleanup — manage disk space by archiving old evidence |
+   427→
+   428→### Backing Up Uploads
+   429→
+   430→```bash
+   431→# From the host machine, copy the volume contents to a backup location
+   432→docker cp coolify-isecurify-app-1:/app/uploads ./uploads-backup-$(date +%Y%m%d)
+   433→```
+   434→
+   435→Or set up a cron job to periodically sync to S3-compatible storage:
+   436→
+   437→```bash
+   438→# Using AWS CLI (install awscli first)
+   439→aws s3 sync /var/lib/docker/volumes/isecurify-uploads/_data s3://your-bucket/isecurify-uploads/
+   440→```
+   441→
+   442→---
+   443→
+   444→## Troubleshooting
+   445→
+   446→| Problem | Solution |
+   447→|---------|----------|
+   448→| **`DATABASE_URL not found` error at startup** | Check Coolify → Application → Environment Variables. The `DATABASE_URL` must be present and the `mysql://` protocol prefix must be included. |
+   449→| **`Can't reach database server` / connection refused** | Verify the MySQL service name in Coolify matches the hostname in `DATABASE_URL`. If your MySQL service is named `mysql-isecurify`, use `mysql-isecurify` (not `localhost` or `127.0.0.1`). |
+   450→| **`Table 'isecurify.User' doesn't exist`** | Prisma `db push` didn't run successfully. Check the container startup logs in Coolify → Application → Logs. Look for errors from `prisma db push`. |
+   451→| **Build fails on `bun install`** | Ensure `bun.lock` is committed to the Git repository. The Dockerfile uses `--frozen-lockfile` which requires the lockfile. Run `bun install` locally and commit the generated `bun.lock`. |
+   452→| **Build fails on `prisma generate`** | Check that `prisma/schema.prisma` is valid. Run `bunx prisma validate` locally. Also ensure the datasource `provider` is set to `"mysql"` (not `"sqlite"`) for production. |
+   453→| **Uploads not persisting across deploys** | Verify that the `/app/uploads` volume is mounted in Coolify → Application → Storages. If the volume is missing, uploaded files exist only inside the ephemeral container filesystem. |
+   454→| **`NEXTAUTH_SECRET` error in logs** | Set the `NEXTAUTH_SECRET` environment variable in Coolify, even though the platform uses custom auth. The `next-auth` package checks for this variable during initialization. Generate one with `openssl rand -base64 32`. |
+   455→| **Login redirect loop or cookies not set** | Ensure SSL is enabled (HTTPS). Session cookies use the `Secure` flag and will not be sent over plain HTTP. Check Coolify → Domains → SSL Certificate is active. |
+   456→| **Seed data not created on first deploy** | Verify `SEED_DB=true` is set in environment variables. Check the entrypoint logs for "Seeding database..." output. Also ensure `DATABASE_URL` is correct so `prisma db push` succeeds before the seed runs. |
+   457→| **Page shows 502 Bad Gateway** | The container may have crashed. Check Coolify → Application → Logs for startup errors. Common causes: database connection failure, missing env vars, or build errors. |
+   458→| **API returns 401 Unauthorized** | Your session may have expired. Clear cookies and log in again. If the issue persists, check that the `Session` table exists in MySQL and session tokens are being created correctly. |
+   459→
+   460→---
+   461→
+   462→## Backups
+   463→
+   464→### MySQL Database Backups
+   465→
+   466→1. Navigate to Coolify → **MySQL Resource** → **Backups** tab
+   467→2. Enable **Scheduled Backups**
+   468→3. Configure the schedule (e.g., daily at 02:00 UTC)
+   469→4. Set a retention policy (e.g., keep last 30 days)
+   470→5. Optionally configure remote backup storage (S3, SFTP, etc.)
+   471→
+   472→### Manual MySQL Backup
+   473→
+   474→From Coolify Terminal on the MySQL service:
+   475→
+   476→```bash
+   477→mysqldump -u isecurify_user -p isecurify > /var/lib/mysql/backups/isecurify-$(date +%Y%m%d).sql
+   478→```
+   479→
+   480→### File Upload Backups
+   481→
+   482→The `/app/uploads` volume contains all user-uploaded evidence files. Back these up regularly:
+   483→
+   484→```bash
+   485→# From the host machine
+   486→docker cp <container_id>:/app/uploads ./uploads-backup
+   487→```
+   488→
+   489→For automated backups, consider:
+   490→
+   491→- **S3 sync** with a cron job on the host
+   492→- **Restic** or **Borg** for encrypted, deduplicated backups
+   493→- **Coolify's built-in volume backup** (if available in your Coolify version)
+   494→
+   495→---
+   496→
+   497→## Monitoring
+   498→
+   499→### Container Logs
+   500→
+   501→- **Coolify Dashboard**: Application → Logs (live, real-time container output)
+   502→- **SSH**: `docker logs -f <container_name>` on the host
+   503→
+   504→### Health Check
+   505→
+   506→The platform exposes a health check endpoint:
+   507→
+   508→```bash
+   509→curl -s https://your-domain.com/api
+   510→# Expected response: {"message":"Hello, world!"} with HTTP 200
+   511→```
+   512→
+   513→Configure Coolify to monitor this URL:
+   514→
+   515→1. Application → Health Check
+   516→2. Set URL to `/api`
+   517→3. Set expected status code to `200`
+   518→4. Set check interval (e.g., every 60 seconds)
+   519→
+   520→### Key Metrics to Monitor
+   521→
+   522→| Metric | What to Watch |
+   523→|--------|---------------|
+   524→| **Container restarts** | Frequent restarts indicate crash loops — check logs |
+   525→| **Memory usage** | Next.js standalone typically uses 200–500 MB; monitor if using 4 GB RAM VPS |
+   526→| **MySQL connections** | Prisma opens a connection pool; watch for connection exhaustion under load |
+   527→| **Disk usage** | Uploads volume grows over time; monitor available disk space |
+   528→| **Response latency** | Dashboard API calls should return in < 500ms under normal load |
+   529→
+   530→---
+   531→
+   532→## Deployment Checklist
+   533→
+   534→Use this checklist to ensure every step is completed before considering your deployment live:
+   535→
+   536→- [ ] **MySQL resource created in Coolify** — Resources → New → MySQL 8.0
+   537→- [ ] **Database credentials set** — database name: `isecurify`, user: `isecurify_user`, strong password
+   538→- [ ] **Persistent storage enabled for MySQL** — Volume mounted so data survives restarts
+   539→- [ ] **Prisma schema provider updated** — Changed from `"sqlite"` to `"mysql"` in `prisma/schema.prisma`
+   540→- [ ] **Dockerfile created and committed** — Multi-stage build with Bun, Prisma, and entrypoint script
+   541→- [ ] **Application created from GitHub repo** — Coolify → New Resource → Application → GitHub
+   542→- [ ] **Build pack set to Dockerfile** — Not Nixpacks or static
+   543→- [ ] **Port set to 3000** — Matches the standalone server port
+   544→- [ ] **DATABASE_URL configured** — `mysql://isecurify_user:PASSWORD@mysql:3306/isecurify`
+   545→- [ ] **NEXTAUTH_SECRET generated and set** — `openssl rand -base64 32`
+   546→- [ ] **NEXTAUTH_URL set** — `https://your-domain.com`
+   547→- [ ] **NEXT_PUBLIC_APP_URL set** — `https://your-domain.com`
+   548→- [ ] **NODE_ENV set to production**
+   549→- [ ] **PORT set to 3000**
+   550→- [ ] **UPLOAD_PATH set to /app/uploads**
+   551→- [ ] **SEED_DB=true set for first deploy**
+   552→- [ ] **/app/uploads volume mounted** — Coolify → Application → Storages
+   553→- [ ] **Domain configured** — DNS A record pointing to VPS, added in Coolify Domains tab
+   554→- [ ] **SSL certificate generated** — Let's Encrypt auto-issued via Coolify
+   555→- [ ] **First deploy triggered and successful** — Check logs for "Starting iSecurify GRC Platform"
+   556→- [ ] **App accessible at https://your-domain.com** — Login page loads
+   557→- [ ] **Default Super Admin password changed** — Log in and update immediately
+   558→- [ ] **Default Tenant Admin password changed** — Log in and update immediately
+   559→- [ ] **SEED_DB removed or set to false** — Prevent password reset on next deploy
+   560→- [ ] **Second deploy triggered (without SEED_DB)** — Confirm clean startup without seed
+   561→- [ ] **MySQL backup schedule configured** — Coolify → MySQL → Backups
+   562→- [ ] **Upload backup strategy in place** — Volume backup or S3 sync configured
+   563→- [ ] **Health check endpoint verified** — `GET /api` returns 200
+   564→- [ ] **Monitoring confirmed** — Container logs accessible, health check active
+   565→
+   566→---
+   567→
+   568→## Quick Reference
+   569→
+   570→### One-Line Deploy Summary
+   571→
+   572→```bash
+   573→# On your local machine: push code
+   574→git add . && git commit -m "Deploy" && git push origin main
+   575→
+   576→# In Coolify: deploy (automatic if webhook configured, or click Deploy Now)
+   577→
+   578→# On first deploy only: set SEED_DB=true, then remove after deploy
+   579→```
+   580→
+   581→### Key URLs After Deployment
+   582→
+   583→| URL | Purpose |
+   584→|-----|---------|
+   585→| `https://your-domain.com` | Main application (login page) |
+   586→| `https://your-domain.com/api` | Health check endpoint |
+   587→| `https://your-domain.com/dashboard` | Main dashboard (after login) |
+   588→
+   589→### Important File Paths
+   590→
+   591→| Path | Purpose |
+   592→|------|---------|
+   593→| `/app/uploads` | Evidence file uploads (persistent volume) |
+   594→| `/app/prisma/schema.prisma` | Database schema definition |
+   595→| `/app/prisma/seed.ts` | Database seed script |
+   596→| `/app/entrypoint.sh` | Container startup script (db push + seed + server) |
+   597→| `/app/.next/standalone/server.js` | Next.js production server |
+   598→
+   599→---
+   600→
+   601→## Support & Resources
+   602→
+   603→- **Coolify Documentation**: [https://coolify.io/docs](https://coolify.io/docs)
+   604→- **Next.js 16 Documentation**: [https://nextjs.org/docs](https://nextjs.org/docs)
+   605→- **Prisma Documentation**: [https://www.prisma.io/docs](https://www.prisma.io/docs)
+   606→- **Bun Documentation**: [https://bun.sh/docs](https://bun.sh/docs)
+   607→
+   608→---
+   609→
+   610→*This deployment guide is maintained as part of the iSecurify GRC Platform project. For issues or questions, refer to the project repository.*
+   611→

@@ -1,0 +1,32 @@
+# =============================================================
+#  iSecurify GRC Platform — Systemd Service File
+#  Copy to: /etc/systemd/system/isecurify.service
+#  Then:    sudo systemctl daemon-reload
+#           sudo systemctl enable isecurify
+#           sudo systemctl start isecurify
+# =============================================================
+
+[Unit]
+Description=iSecurify GRC Platform
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=isecurify
+Group=isecurify
+WorkingDirectory=/opt/isecurify
+EnvironmentFile=/opt/isecurify/.env
+ExecStartPre=/usr/bin/bunx prisma db push --accept-data-loss 2>/dev/null || /usr/bin/bunx prisma db push
+ExecStart=/usr/bin/bun .next/standalone/server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

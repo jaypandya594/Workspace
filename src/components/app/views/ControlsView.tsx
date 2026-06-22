@@ -481,9 +481,6 @@ function ImportControlsDialog({ frameworks, defaultFrameworkId, onDone }: { fram
   const [parsedCount, setParsedCount] = useState(0)
   const [parseError, setParseError] = useState('')
   const [parsingFile, setParsingFile] = useState(false)
-  const [detectedColumns, setDetectedColumns] = useState<string[]>([])
-  const [manualRef, setManualRef] = useState('')
-  const [manualTitle, setManualTitle] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
