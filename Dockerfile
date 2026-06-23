@@ -33,7 +33,7 @@ RUN chmod +x ./docker-entrypoint.sh
 
 RUN mkdir -p /app/uploads
 
-
+RUN apt-get update && apt-get install -y openssl
 EXPOSE 3000
 
 ENTRYPOINT ["./docker-entrypoint.sh"]
