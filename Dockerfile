@@ -32,6 +32,7 @@ COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN chmod +x ./docker-entrypoint.sh
 
 RUN mkdir -p /app/uploads
+RUN apt-get update && apt-get install -y openssl libssl3
 
 EXPOSE 3000
 
