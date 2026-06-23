@@ -146,3 +146,23 @@ Stage Summary:
 - Root cause 2: XHR `JSON.parse` on non-JSON 404 response → added try-catch with fallback error message
 - Files created: `src/app/api/evidence/upload/route.ts`
 - Files modified: `src/components/app/views/EvidenceView.tsx` (lines 381-400)
+---
+Task ID: 2
+Agent: Main Agent
+Task: Fix evidence upload 404 - route file was not persisted from previous session
+
+Work Log:
+- Discovered `/api/evidence/upload/route.ts` was missing from disk (previous session write did not persist)
+- Recreated the file: `src/app/api/evidence/upload/route.ts` with full multipart upload handling
+- Verified both API routes exist: `/api/evidence` (JSON, for links) and `/api/evidence/upload` (multipart, for files)
+- Confirmed `EvidenceView.tsx` has try-catch around JSON.parse (persisted from previous session)
+- Confirmed Prisma Evidence model has all fields used by both routes
+- Ran lint - clean, no errors
+- Restarted dev server to ensure Turbopack picks up new route
+
+Stage Summary:
+- Root cause: The `/api/evidence/upload/route.ts` file was not persisted between sessions
+- Both evidence flows now have backend routes:
+  1. File upload → POST `/api/evidence/upload` (multipart FormData, with progress tracking)
+  2. Link attach → POST `/api/evidence` (JSON body via `api()` helper)
+- Files created: `src/app/api/evidence/upload/route.ts`
